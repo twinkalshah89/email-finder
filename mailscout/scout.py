@@ -1,3 +1,5 @@
+print("Scout script running locally!")
+
 # import smtplib
 # import dns.resolver
 # import random
@@ -697,3 +699,5 @@ class Scout:
     def generate_prefixes(self, domain: str) -> List[str]:
         prefixes = ['admin', 'contact', 'hello', 'team', 'support', 'info', 'mail']
         return [f"{prefix}@{domain}" for prefix in prefixes]
+
+   
