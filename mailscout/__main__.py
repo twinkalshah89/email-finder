@@ -17,9 +17,11 @@ import time
 from functools import wraps
 import re
 from typing import Dict, Any
+import os
+import socket
 
 app = Flask(__name__)
-scout = Scout()  # Initialize Scout
+scout = Scout(smtp_timeout=int(os.getenv("SMTP_TIMEOUT", "10")))  # Initialize Scout with higher timeout
 
 # Rate limiting configuration
 RATE_LIMIT = 100  # requests per minute
@@ -79,20 +81,38 @@ def home():
 @app.route("/verify", methods=["POST"])
 @rate_limit
 def verify_email():
-    data = request.get_json()
-    is_valid, error = validate_request_data(data, ["email"])
+    data = request.get_json(silent=True)
+    is_valid, error = validate_request_data(data or {}, ["email"])
     if not is_valid:
         return jsonify({"error": error}), 400
 
-    email = data.get("email", "").strip().lower()
+    email = (data.get("email", "") if data else "").strip().lower()
     if not validate_email(email):
         return jsonify({"error": "Invalid email format"}), 400
 
     try:
-        is_valid = scout.check_smtp(email)
+        result = scout.check_smtp(email)
+        valid_bool = None
+        status = None
+        message = None
+        if isinstance(result, dict):
+            status = result.get("status")
+            message = result.get("message")
+            if status in ["valid", "risky"]:
+                valid_bool = True
+            elif status == "invalid":
+                valid_bool = False
+            else:
+                valid_bool = None
+        else:
+            valid_bool = bool(result)
+
         return jsonify({
             "email": email,
-            "valid": is_valid,
+            "valid": valid_bool,
+            "status": status,
+            "message": message,
+            "details": result if isinstance(result, dict) else None,
             "timestamp": time.time()
         })
     except Exception as e:
@@ -165,22 +185,27 @@ def verify_email():
 @rate_limit
 def find_emails():
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
         if not data:
             return jsonify({"error": "No JSON data provided"}), 400
 
         domain = data.get("domain", "").strip().lower()
-        if not domain:
-            return jsonify({"error": "Domain is required"}), 400
+        if not domain or not validate_domain(domain):
+            return jsonify({"error": "Domain is required and must be valid"}), 400
 
         names = data.get("names", [])
         if not isinstance(names, list) or not names:
             return jsonify({"error": "Names must be a non-empty list"}), 400
 
-        # Call Scout with the names list directly
         result = scout.find_valid_emails(domain=domain, names=names)
 
-        return jsonify(result)
+        response = {
+            "domain": domain,
+            "names": names,
+            "result": result,
+            "timestamp": time.time()
+        }
+        return jsonify(response)
 
     except Exception as e:
         print(f"Error in find_emails: {str(e)}")
@@ -188,6 +213,25 @@ def find_emails():
             "error": "Email finding failed",
             "details": str(e)
         }), 500
+
+@app.route("/diagnostics/smtp", methods=["GET"]) 
+@rate_limit
+def smtp_diagnostics():
+    target = request.args.get("host", "aspmx.l.google.com")
+    port = int(request.args.get("port", "25"))
+    timeout = int(request.args.get("timeout", "5"))
+    try:
+        with socket.create_connection((target, port), timeout=timeout):
+            reachable = True
+    except Exception as e:
+        reachable = False
+        err = str(e)
+    return jsonify({
+        "target": f"{target}:{port}",
+        "reachable": reachable,
+        "note": None if reachable else "SMTP egress blocked or target unreachable",
+        "timestamp": time.time()
+    })
 
 @app.errorhandler(404)
 def not_found(error):
