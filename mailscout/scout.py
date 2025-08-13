@@ -499,6 +499,7 @@ import time
 from typing import List, Optional, Union, Dict
 from unidecode import unidecode
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import socket
 
 
 class Scout:
@@ -528,6 +529,9 @@ class Scout:
         mx_record = ""
         start_time = time.time()
 
+        network_timeouts = 0
+        network_refused = 0
+
         try:
             records = dns.resolver.resolve(domain, 'MX')
             mx_hosts = [str(r.exchange).rstrip('.') for r in records]
@@ -537,7 +541,16 @@ class Scout:
                     with smtplib.SMTP(mx, port, timeout=self.smtp_timeout) as server:
                         connections += 1
                         server.set_debuglevel(0)
+                        # EHLO, then STARTTLS if offered
                         server.ehlo("blu-harvest.com")
+                        if server.has_extn('starttls'):
+                            try:
+                                server.starttls()
+                                server.ehlo("blu-harvest.com")
+                            except Exception:
+                                # If STARTTLS handshake fails, proceed without TLS
+                                pass
+                        # MAIL FROM and RCPT TO
                         server.mail('noreply@blu-harvest.com')
                         ver_ops += 1
                         code, message = server.rcpt(email)
@@ -549,6 +562,9 @@ class Scout:
                                 catch_all_flag = self.is_catch_all(domain, mx)
                             status = "risky" if catch_all_flag else "valid"
                             msg = "Catch-All" if catch_all_flag else f"{code} {message.decode()}"
+                        elif 400 <= code < 500:
+                            status = "unknown"
+                            msg = f"{code} {message.decode()}"
                         else:
                             status = "invalid"
                             msg = f"{code} {message.decode()}"
@@ -566,16 +582,33 @@ class Scout:
                             "ver_ops": ver_ops,
                             "time_exec": time_exec
                         }
+                except (socket.timeout, TimeoutError):
+                    network_timeouts += 1
+                    connections += 1
+                    continue
+                except (ConnectionRefusedError, OSError):
+                    network_refused += 1
+                    connections += 1
+                    continue
                 except Exception:
                     connections += 1
                     continue
 
             time_exec = round(time.time() - start_time, 3)
+            message = "SMTP failed for all MX records & ports"
+            status = "invalid"
+            if network_timeouts > 0 and connections == network_timeouts:
+                message = "All MX connections timed out on port 25 (SMTP egress likely blocked)"
+                status = "unknown"
+            elif network_refused > 0 and connections == network_refused:
+                message = "All MX connections refused on port 25 (blocked by network/firewall)"
+                status = "unknown"
+
             return {
                 "email": email,
-                "status": "invalid",
+                "status": status,
                 "catch_all": False,
-                "message": "SMTP failed for all MX records & ports",
+                "message": message,
                 "user_name": email.split('@')[0].replace('.', ' ').title(),
                 "domain": domain,
                 "mx": "",
@@ -588,7 +621,7 @@ class Scout:
             time_exec = round(time.time() - start_time, 3)
             return {
                 "email": email,
-                "status": "invalid",
+                "status": "unknown",
                 "catch_all": False,
                 "message": f"Rejected: {str(e)}",
                 "user_name": email.split('@')[0].replace('.', ' ').title(),
